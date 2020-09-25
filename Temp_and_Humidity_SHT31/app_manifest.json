@@ -1,0 +1,15 @@
+{
+  "SchemaVersion": 1,
+  "Name": "Temp_and_Humidity_SHT31",
+  "ComponentId": "819255ff-8640-41fd-aea7-f85d34c491d5",
+  "EntryPoint": "/bin/app",
+  "CmdArgs": ["--ConnectionType", "DPS", "--ScopeID", "0ne0018679C"],
+    "Capabilities": {
+    "Gpio": [ 8, 9, 10, 15, 16, 17, 18, 19, 20, 12, 13, 0, 1, 4, 5, 57, 58, 11, 14, 48 ],
+    "Uart": [ "ISU0", "ISU3" ],
+    "AllowedApplicationConnections": [],
+    "AllowedConnections": [ "global.azure-devices-provisioning.net",  "daniel-iothub.azure-devices.net"],
+    "DeviceAuthentication": "ca3e2ef8-2407-45bc-93e5-95775bf2f629"
+  },
+  "ApplicationType": "Default"
+}
