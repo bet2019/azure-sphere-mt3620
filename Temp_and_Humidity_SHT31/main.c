@@ -18,8 +18,7 @@
 #include "../MT3620_Grove_Shield_Library/Sensors/GroveLightSensor.h"
 #include "../MT3620_Grove_Shield_Library/Sensors/GroveAD7992.h"
 #include "../MT3620_Grove_Shield_Library/Sensors/GroveOledDisplay96x96.h"
-
-#include "eventloop_timer_utilities.h"
+#include "../MT3620_Grove_Shield_Library/Sensors/GroveRelay.h"
 
 // Azure IoT SDK
 #include <azureiot/iothub_client_core_common.h>
@@ -101,6 +100,8 @@ static const int deviceIdForDaaCertUsage = 1; // A constant used to direct the I
                                               // the DAA cert under the hood.
 static const char NetworkInterface[] = "wlan0";
 
+static const void *relay  = NULL;
+
 static void ParseCommandLineArguments(int argc, char *argv[]);
 static void SendTelemetry(const char *jsonMessage);
 static bool SetUpAzureIoTHubClientWithDps(void);
@@ -110,6 +111,10 @@ static const char *GetAzureSphereProvisioningResultString(AZURE_SPHERE_PROV_RETU
 static void SendEventCallback(IOTHUB_CLIENT_CONFIRMATION_RESULT result, void *context);
 static bool IsConnectionReadyToSendTelemetry(void);
 static const char *GetReasonString(IOTHUB_CLIENT_CONNECTION_STATUS_REASON reason);
+
+static int DeviceMethodCallback(const char *methodName, const unsigned char *payload,
+                                size_t payloadSize, unsigned char **response, size_t *responseSize,
+                                void *userContextCallback);
 
 #define TELEMETRY_BUFFER_SIZE 100
 
@@ -192,8 +197,6 @@ int main(int argc, char *argv[])
 
     ParseCommandLineArguments(argc, argv);
 
-    SetUpAzureIoTHubClientWithDps();
-
     // Register a SIGTERM handler for termination requests
     struct sigaction action;
     memset(&action, 0, sizeof(struct sigaction));
@@ -202,12 +205,12 @@ int main(int argc, char *argv[])
 
     int i2cFd;
     GroveShield_Initialize(&i2cFd, 115200);
+
     void *sht31 = GroveTempHumiSHT31_Open(i2cFd);
-
-    // Initialize Light Sensor
     void *lightSensor = GroveLightSensor_Init(i2cFd, 0);
-
     GroveOledDisplay_Init(i2cFd, SH1107G);
+
+    relay = GroveRelay_Open(4);
 
     setNormalDisplay();
     setVerticalMode();
@@ -218,9 +221,31 @@ int main(int argc, char *argv[])
     time_t t;
     struct tm *lt;
 
+    // Check whether the device is connected to the internet.
+    Networking_InterfaceConnectionStatus status;
+
     // // Main loop
     while (exitCode == ExitCode_Success)
     {
+        if (Networking_GetInterfaceConnectionStatus(NetworkInterface, &status) == 0)
+        {
+            if ((status & Networking_InterfaceConnectionStatus_ConnectedToInternet) &&
+                (iotHubClientAuthenticationState == IoTHubClientAuthenticationState_NotAuthenticated))
+            {
+                SetUpAzureIoTHubClientWithDps();
+            }
+        }
+        else
+        {
+            if (errno != EAGAIN)
+            {
+                Log_Debug("ERROR: Networking_GetInterfaceConnectionStatus: %d (%s)\n", errno,
+                          strerror(errno));
+                exitCode = ExitCode_InterfaceConnectionStatus_Failed;
+                continue;
+            }
+        }
+
         GroveTempHumiSHT31_Read(sht31);
         float temp = GroveTempHumiSHT31_GetTemperature(sht31);
         float humi = GroveTempHumiSHT31_GetHumidity(sht31);
@@ -231,17 +256,31 @@ int main(int argc, char *argv[])
 
         for (uint8_t i = 0; i < 16; i++)
         {
-            setTextXY(i, 48); //set Cursor to ith line, 0th column
-            setGrayLevel(i);  //Set Grayscale level. Any number between 0 - 15.
+            setGrayLevel(i); //Set Grayscale level. Any number between 0 - 15.
 
-            if (i > 1 && i < 5) //234
+            if (i == 3) //234
+            {
+                setTextXY(i, 8);
+                putString("Temp:");
+                setTextXY(i, 64);
                 putNumber((uint16_t)temp);
+            }
 
-            if (i > 6 && i < 10) //789
+            if (i == 8) //789
+            {
+                setTextXY(i, 8);
+                putString("Humi:");
+                setTextXY(i, 64);
                 putNumber((uint16_t)humi);
+            }
 
-            if (i > 11 && i < 15) //12,13,14
+            if (i == 13) //12,13,14
+            {
+                setTextXY(i, 8);
+                putString("Light:");
+                setTextXY(i, 64);
                 putNumber((uint16_t)light);
+            }
         }
 
         time(&t);
@@ -287,11 +326,52 @@ static void ConnectionStatusCallback(IOTHUB_CLIENT_CONNECTION_STATUS result,
 }
 
 /// <summary>
+///     Callback invoked when a Direct Method is received from Azure IoT Hub.
+/// </summary>
+static int DeviceMethodCallback(const char *methodName, const unsigned char *payload,
+                                size_t payloadSize, unsigned char **response, size_t *responseSize,
+                                void *userContextCallback)
+{
+    int result;
+    char *responseString;
+
+    Log_Debug("Received Device Method callback: Method name %s.\n", methodName);
+
+    if (strcmp("TriggerAlarm", methodName) == 0) {
+        // Output alarm using Log_Debug
+        Log_Debug("  ----- ALARM TRIGGERED! -----\n");
+
+        GroveRelay_On(relay);
+        usleep(1000000);
+        GroveRelay_Off(relay);
+
+        responseString = "\"Alarm Triggered\""; // must be a JSON string (in quotes)
+        result = 200;
+    } else {
+        // All other method names are ignored
+        responseString = "{}";
+        result = -1;
+    }
+
+    // if 'response' is non-NULL, the Azure IoT library frees it after use, so copy it to heap
+    *responseSize = strlen(responseString);
+    *response = malloc(*responseSize);
+    memcpy(*response, responseString, *responseSize);
+    return result;
+}
+
+/// <summary>
 ///     Sets up the Azure IoT Hub connection (creates the iothubClientHandle)
 ///     with DPS
 /// </summary>
 static bool SetUpAzureIoTHubClientWithDps(void)
 {
+
+    if (iothubClientHandle != NULL)
+    {
+        IoTHubDeviceClient_LL_Destroy(iothubClientHandle);
+    }
+
     AZURE_SPHERE_PROV_RETURN_VALUE provResult =
         IoTHubDeviceClient_LL_CreateWithAzureSphereDeviceAuthProvisioning(scopeId, 10000, &iothubClientHandle);
     Log_Debug("IoTHubDeviceClient_LL_CreateWithAzureSphereDeviceAuthProvisioning returned '%s'.\n",
@@ -305,6 +385,8 @@ static bool SetUpAzureIoTHubClientWithDps(void)
     iotHubClientAuthenticationState = IoTHubClientAuthenticationState_Authenticated;
 
     IoTHubDeviceClient_LL_SetConnectionStatusCallback(iothubClientHandle, ConnectionStatusCallback, NULL);
+    IoTHubDeviceClient_LL_SetDeviceMethodCallback(iothubClientHandle, DeviceMethodCallback, NULL);
+
 
     return true;
 }
